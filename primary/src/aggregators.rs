@@ -1,12 +1,12 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult};
-use crate::messages::{Certificate, Header, ProposalParents, Vote};
+use crate::messages::{Certificate, Header, ProposalParents, StepVertexSource, Vote};
 use crate::primary::Round;
 use config::{Committee, Stake};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, Signature};
 use log::debug;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 /// Aggregates votes for a particular header into a certificate.
@@ -69,6 +69,9 @@ pub struct CertificatesAggregator {
     wait_duration: Duration,
     /// Incremental union of parents' solid-step summaries for the proposal round.
     solid_step_union: HashSet<Digest>,
+    /// Tracks whether each solid-step vertex arrived via direct weak edges, intermediate relay,
+    /// or both. This lets us check whether the sigma=2 intermediate layer is actually helping.
+    solid_step_sources: HashMap<Digest, StepVertexSource>,
     /// Incremental union of parents' solid-wave summaries for the proposal round.
     solid_wave_union: HashSet<Digest>,
     /// Last computed union of parents' solid_step_vertices_merged on solid rounds
@@ -88,6 +91,7 @@ impl CertificatesAggregator {
             quorum_reached_time: None,
             wait_duration: Duration::from_millis(20),
             solid_step_union: HashSet::new(),
+            solid_step_sources: HashMap::new(),
             solid_wave_union: HashSet::new(),
             last_union_set: None,
         }
@@ -100,13 +104,19 @@ impl CertificatesAggregator {
         self.last_union_set.as_deref()
     }
 
-    fn extend_step_union(&mut self, certificate: &Certificate) {
-        if certificate.header.solid_step_vertices_merged.is_empty() {
-            self.solid_step_union
-                .extend(certificate.header.solid_step_vertices.iter().cloned());
+    fn extend_step_union(&mut self, certificate: &Certificate, source: StepVertexSource) {
+        let vertices = if certificate.header.solid_step_vertices_merged.is_empty() {
+            &certificate.header.solid_step_vertices
         } else {
-            self.solid_step_union
-                .extend(certificate.header.solid_step_vertices_merged.iter().cloned());
+            &certificate.header.solid_step_vertices_merged
+        };
+
+        for digest in vertices {
+            self.solid_step_union.insert(digest.clone());
+            self.solid_step_sources
+                .entry(digest.clone())
+                .or_default()
+                .merge(source);
         }
     }
 
@@ -115,8 +125,13 @@ impl CertificatesAggregator {
             self.solid_wave_union
                 .extend(certificate.header.solid_wave_vertices.iter().cloned());
         } else {
-            self.solid_wave_union
-                .extend(certificate.header.solid_wave_vertices_merged.iter().cloned());
+            self.solid_wave_union.extend(
+                certificate
+                    .header
+                    .solid_wave_vertices_merged
+                    .iter()
+                    .cloned(),
+            );
         }
     }
 
@@ -145,7 +160,7 @@ impl CertificatesAggregator {
         // Add the certificate to the appropriate list.
         if certificate.round() == self.expected_round {
             self.certificates.push(certificate.digest());
-            self.extend_step_union(&certificate);
+            self.extend_step_union(&certificate, StepVertexSource::relay_merged());
             self.extend_wave_union(&certificate);
             self.weight += committee.stake(&origin);
         } else if certificate.round() >= regular_weak_start
@@ -153,7 +168,7 @@ impl CertificatesAggregator {
         {
             self.certificates.push(certificate.digest());
             self.weak_certificates.push(certificate.digest());
-            self.extend_step_union(&certificate);
+            self.extend_step_union(&certificate, StepVertexSource::direct_weak());
             self.extend_wave_union(&certificate);
         } else if certificate.round() >= commit_weak_start
             && certificate.round() < regular_weak_start
@@ -181,9 +196,8 @@ impl CertificatesAggregator {
         );
         if is_solid_step {
             self.last_union_set = Some(self.solid_step_union.iter().cloned().collect());
-            self.has_quorum =
-                self.solid_step_union.len()
-                    >= committee.processing_threshold(current_round) as usize;
+            self.has_quorum = self.solid_step_union.len()
+                >= committee.processing_threshold(current_round) as usize;
             debug!(
                 "Current round: {}, The number of merged solid-step vertices is {}",
                 current_round,
@@ -213,6 +227,7 @@ impl CertificatesAggregator {
             }
             let mut proposal_parents = ProposalParents::from(self.certificates.clone());
             proposal_parents.solid_step_union = self.solid_step_union.clone();
+            proposal_parents.solid_step_sources = self.solid_step_sources.clone();
             proposal_parents.solid_wave_union = self.solid_wave_union.clone();
             // if self.quorum_reached_time.unwrap().elapsed() >= self.wait_duration || self.weight >= committee.max_threshold() {
             return Ok(Some(proposal_parents));

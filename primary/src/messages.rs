@@ -6,7 +6,7 @@ use crypto::{Digest, Hash, PublicKey, Signature, SignatureService};
 use ed25519_dalek::Digest as _;
 use ed25519_dalek::Sha512;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::TryInto;
 use std::fmt;
 
@@ -101,7 +101,47 @@ impl Header {
 pub struct ProposalParents {
     pub parents: Vec<Digest>,
     pub solid_step_union: HashSet<Digest>,
+    pub solid_step_sources: HashMap<Digest, StepVertexSource>,
     pub solid_wave_union: HashSet<Digest>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StepVertexSource {
+    pub direct_weak: bool,
+    pub relay_merged: bool,
+}
+
+impl StepVertexSource {
+    pub fn direct_weak() -> Self {
+        Self {
+            direct_weak: true,
+            relay_merged: false,
+        }
+    }
+
+    pub fn relay_merged() -> Self {
+        Self {
+            direct_weak: false,
+            relay_merged: true,
+        }
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.direct_weak |= other.direct_weak;
+        self.relay_merged |= other.relay_merged;
+    }
+
+    pub fn is_direct_weak_only(&self) -> bool {
+        self.direct_weak && !self.relay_merged
+    }
+
+    pub fn is_relay_only(&self) -> bool {
+        self.relay_merged && !self.direct_weak
+    }
+
+    pub fn is_both(&self) -> bool {
+        self.direct_weak && self.relay_merged
+    }
 }
 
 impl From<Vec<Digest>> for ProposalParents {
@@ -109,6 +149,7 @@ impl From<Vec<Digest>> for ProposalParents {
         Self {
             parents,
             solid_step_union: HashSet::new(),
+            solid_step_sources: HashMap::new(),
             solid_wave_union: HashSet::new(),
         }
     }

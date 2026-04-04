@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::messages::{Certificate, Header, ProposalParents};
+use crate::messages::{Certificate, Header, ProposalParents, StepVertexSource};
 use crate::primary::Round;
 use config::{Committee, WorkerId};
 use crypto::Hash as _;
@@ -58,6 +58,7 @@ pub struct Proposer {
 struct UnlockedRound {
     parents: Vec<Digest>,
     solid_step_union: HashSet<Digest>,
+    solid_step_sources: HashMap<Digest, StepVertexSource>,
     solid_wave_union: HashSet<Digest>,
     ready_since: Instant,
     unlock_order: u64,
@@ -115,6 +116,7 @@ impl Proposer {
             UnlockedRound {
                 parents: genesis,
                 solid_step_union: HashSet::new(),
+                solid_step_sources: HashMap::new(),
                 solid_wave_union: HashSet::new(),
                 ready_since: Instant::now(),
                 unlock_order: 0,
@@ -155,11 +157,38 @@ impl Proposer {
         (old_len, merged_len)
     }
 
+    fn step_source_counts(
+        sources: &HashMap<Digest, StepVertexSource>,
+    ) -> (usize, usize, usize) {
+        let mut direct_weak_only = 0;
+        let mut relay_only = 0;
+        let mut both = 0;
+
+        for source in sources.values() {
+            if source.is_both() {
+                both += 1;
+            } else if source.is_direct_weak_only() {
+                direct_weak_only += 1;
+            } else if source.is_relay_only() {
+                relay_only += 1;
+            }
+        }
+
+        (direct_weak_only, relay_only, both)
+    }
+
     fn merge_unlocked_round(state: &mut UnlockedRound, update: ProposalParents) -> (usize, usize) {
         let solid_step_old_len = state.solid_step_union.len();
         let solid_wave_old_len = state.solid_wave_union.len();
         let (_old_len, _merged_len) = Self::merge_parents(&mut state.parents, update.parents);
         state.solid_step_union.extend(update.solid_step_union);
+        for (digest, source) in update.solid_step_sources {
+            state
+                .solid_step_sources
+                .entry(digest)
+                .or_default()
+                .merge(source);
+        }
         state.solid_wave_union.extend(update.solid_wave_union);
         (
             state
@@ -394,9 +423,15 @@ impl Proposer {
         }
 
         if self.proposed_rounds.contains(&round) {
+            let (direct_weak_only, relay_only, both) =
+                Self::step_source_counts(&parent_update.solid_step_sources);
             debug!(
-                "Received stale parents for already proposed round {}",
-                round
+                "Received stale parents for already proposed round {} (step_vertices={}, weak_only={}, relay_only={}, both={})",
+                round,
+                parent_update.solid_step_sources.len(),
+                direct_weak_only,
+                relay_only,
+                both
             );
             return;
         }
@@ -432,6 +467,7 @@ impl Proposer {
                     UnlockedRound {
                         parents: parent_update.parents,
                         solid_step_union: parent_update.solid_step_union,
+                        solid_step_sources: parent_update.solid_step_sources,
                         solid_wave_union: parent_update.solid_wave_union,
                         ready_since: Instant::now(),
                         unlock_order,
@@ -592,6 +628,18 @@ impl Proposer {
             header.solid_step_vertices.len(),
             header.solid_wave_vertices.len()
         );
+        if self.is_critical_round(round) {
+            let (direct_weak_only, relay_only, both) =
+                Self::step_source_counts(&unlocked_round.solid_step_sources);
+            debug!(
+                "CRITICAL_STEP_PROVENANCE round={} step_vertices={} weak_only={} relay_only={} both={}",
+                round,
+                unlocked_round.solid_step_sources.len(),
+                direct_weak_only,
+                relay_only,
+                both
+            );
+        }
 
         #[cfg(feature = "benchmark")]
         for digest in header.payload.keys() {

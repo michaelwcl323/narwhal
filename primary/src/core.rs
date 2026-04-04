@@ -174,6 +174,69 @@ impl Core {
         self.process_header(&header).await
     }
 
+    async fn resolve_step_vertex_label(&mut self, digest: &Digest) -> String {
+        match self.store.read(digest.to_vec()).await {
+            Ok(Some(bytes)) => {
+                if let Ok(header) = bincode::deserialize::<Header>(&bytes) {
+                    let node_id = self.node_index(&header.author).unwrap_or(999);
+                    return format!("[{},{}]", header.round, node_id);
+                }
+                if let Ok(certificate) = bincode::deserialize::<Certificate>(&bytes) {
+                    let node_id = self.node_index(&certificate.origin()).unwrap_or(999);
+                    return format!("[{},{}]", certificate.round(), node_id);
+                }
+                format!("{:?}", digest)
+            }
+            _ => format!("{:?}", digest),
+        }
+    }
+
+    async fn resolve_step_vertex_labels(&mut self, digests: &[Digest]) -> Vec<String> {
+        let mut labels = Vec::with_capacity(digests.len());
+        for digest in digests {
+            labels.push(self.resolve_step_vertex_label(digest).await);
+        }
+        labels.sort();
+        labels
+    }
+
+    async fn log_parent_provenance(&mut self, target_round: Round, parents: &ProposalParents) {
+        let proposal_round = target_round + 1;
+        if !self.committee.is_solid_step(proposal_round) || !log::log_enabled!(log::Level::Debug) {
+            return;
+        }
+
+        let mut direct_weak_only = Vec::new();
+        let mut relay_only = Vec::new();
+        let mut both = Vec::new();
+        for (digest, source) in &parents.solid_step_sources {
+            if source.is_both() {
+                both.push(digest.clone());
+            } else if source.is_direct_weak_only() {
+                direct_weak_only.push(digest.clone());
+            } else if source.is_relay_only() {
+                relay_only.push(digest.clone());
+            }
+        }
+
+        let direct_weak_only = self.resolve_step_vertex_labels(&direct_weak_only).await;
+        let relay_only = self.resolve_step_vertex_labels(&relay_only).await;
+        let both = self.resolve_step_vertex_labels(&both).await;
+
+        debug!(
+            "CRITICAL_PARENT_PROVENANCE target_round={} proposal_round={} step_vertices={} weak_only={} relay_only={} both={} weak_only_vertices=[{}] relay_only_vertices=[{}] both_vertices=[{}]",
+            target_round,
+            proposal_round,
+            parents.solid_step_sources.len(),
+            direct_weak_only.len(),
+            relay_only.len(),
+            both.len(),
+            direct_weak_only.join(", "),
+            relay_only.join(", "),
+            both.join(", ")
+        );
+    }
+
     #[async_recursion]
     async fn process_header(&mut self, header: &Header) -> DagResult<()> {
         let origin_node = self
@@ -455,6 +518,7 @@ impl Core {
                 .or_insert_with(|| Box::new(CertificatesAggregator::new(target_round)))
                 .append(certificate.clone(), &self.committee)?
             {
+                self.log_parent_provenance(target_round, &parents).await;
                 // Send it to the `Proposer`.
                 self.tx_proposer
                     .send((parents, target_round))
