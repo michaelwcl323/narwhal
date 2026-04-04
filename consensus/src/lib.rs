@@ -211,7 +211,7 @@ impl Consensus {
             let r = round - step_length;
             let leader_round = r - wave_length;
             let support_round = r - step_length;
-            if r % wave_length != 0 {
+            if leader_round % wave_length != 0 {
                 continue;
             }
             if r < 2 * wave_length {
@@ -271,31 +271,46 @@ leader_digest(cert)= {:?} -> {:?} (node_id={})",
                 .get(&support_round)
                 .expect("Support round should exist in the local DAG");
             let debug_logging = log_enabled!(log::Level::Debug);
-            let mut support_nodes = Vec::new();
+            let mut step_support_nodes = Vec::new();
+            let mut wave_support_nodes = Vec::new();
             let mut support_entries = if debug_logging {
                 Some(Vec::with_capacity(support_round_map.len()))
             } else {
                 None
             };
-            let mut stake = 0;
+            let mut step_stake = 0;
+            let mut wave_stake = 0;
             for (_, certificate) in support_round_map.values() {
-                let vertices = &certificate.header.solid_wave_vertices;
-                let supports =
-                    vertices.contains(&leader_header_id) || vertices.contains(&leader_digest);
+                let step_vertices = &certificate.header.solid_step_vertices;
+                let wave_vertices = &certificate.header.solid_wave_vertices;
+                let step_supports = step_vertices.contains(&leader_header_id)
+                    || step_vertices.contains(&leader_digest);
+                let wave_supports = wave_vertices.contains(&leader_header_id)
+                    || wave_vertices.contains(&leader_digest);
                 let node_id = self.author_to_node_id(certificate.origin());
 
-                if supports {
-                    support_nodes.push(node_id);
-                    stake += self.committee.stake(&certificate.origin());
+                if step_supports {
+                    step_support_nodes.push(node_id);
+                    step_stake += self.committee.stake(&certificate.origin());
+                }
+                if wave_supports {
+                    wave_support_nodes.push(node_id);
+                    wave_stake += self.committee.stake(&certificate.origin());
                 }
 
                 if let Some(entries) = support_entries.as_mut() {
                     entries.push(format!(
-                        "[{},{}]:support={} solid=[{}] merged=[{}]",
+                        "[{},{}]:step_support={} step=[{}] step_merged=[{}] wave_support={} wave=[{}] wave_merged=[{}]",
                         certificate.round(),
                         node_id,
-                        supports,
-                        self.render_digest_set(&state, &certificate.header.solid_wave_vertices),
+                        step_supports,
+                        self.render_digest_set(&state, step_vertices),
+                        self.render_digest_set(
+                            &state,
+                            &certificate.header.solid_step_vertices_merged
+                        ),
+                        wave_supports,
+                        self.render_digest_set(&state, wave_vertices),
                         self.render_digest_set(
                             &state,
                             &certificate.header.solid_wave_vertices_merged
@@ -303,18 +318,45 @@ leader_digest(cert)= {:?} -> {:?} (node_id={})",
                     ));
                 }
             }
-            support_nodes.sort_unstable();
+            step_support_nodes.sort_unstable();
+            wave_support_nodes.sort_unstable();
+            let stake = step_stake;
             let threshold = self.committee.validity_threshold();
             let leader_node = self.author_to_node_id(leader.origin());
+            let step_only_nodes: Vec<_> = step_support_nodes
+                .iter()
+                .copied()
+                .filter(|node| !wave_support_nodes.contains(node))
+                .collect();
+            let wave_only_nodes: Vec<_> = wave_support_nodes
+                .iter()
+                .copied()
+                .filter(|node| !step_support_nodes.contains(node))
+                .collect();
+            let support_disagrees =
+                step_stake != wave_stake || step_support_nodes != wave_support_nodes;
             if stake < threshold {
                 info!(
-                    "DAG_COMMIT_CHECK path=solid leader_round={} leader_node={} support_round={} support_basis=solid_wave_vertices stake={} threshold={} result=insufficient_stake support_set={:?}",
+                    "DAG_COMMIT_CHECK path=solid leader_round={} leader_node={} support_round={} support_basis=solid_step_vertices stake={} threshold={} result=insufficient_stake support_set={:?}",
                     leader_round,
                     leader_node,
                     support_round,
                     stake,
                     threshold,
-                    support_nodes
+                    step_support_nodes
+                );
+                info!(
+                    "DAG_COMMIT_SUPPORT_COMPARE leader_round={} leader_node={} support_round={} threshold={} step_stake={} step_support_set={:?} wave_stake={} wave_support_set={:?} step_only={:?} wave_only={:?}",
+                    leader_round,
+                    leader_node,
+                    support_round,
+                    threshold,
+                    step_stake,
+                    step_support_nodes,
+                    wave_stake,
+                    wave_support_nodes,
+                    step_only_nodes,
+                    wave_only_nodes
                 );
                 if log_enabled!(log::Level::Debug) && stake == 0 {
                     debug!(
@@ -330,32 +372,39 @@ leader_digest(cert)= {:?} -> {:?} (node_id={})",
                             let origin = cert.origin();
                             let node_id = self.author_to_node_id(origin);
 
-                            let base = &cert.header.solid_wave_vertices;
-                            let vertices = base;
-
-                            let contains_leader_header = vertices.contains(&leader_header_id);
-                            let contains_leader_digest = vertices.contains(&leader_digest);
-
-                            let mut resolved: Vec<String> = Vec::with_capacity(vertices.len());
-                            for d in vertices.iter() {
-                                if let Some((rd, a)) = self.find_certificate_in_dag(&state, d) {
-                                    let nid = self.author_to_node_id(a);
-                                    resolved.push(format!("[{},{}]", rd, nid));
-                                } else {
-                                    resolved.push("[?,?]".to_string());
+                            let describe_vertices = |vertices: &std::collections::HashSet<Digest>| {
+                                let contains_leader_header = vertices.contains(&leader_header_id);
+                                let contains_leader_digest = vertices.contains(&leader_digest);
+                                let mut resolved: Vec<String> = Vec::with_capacity(vertices.len());
+                                for d in vertices.iter() {
+                                    if let Some((rd, a)) = self.find_certificate_in_dag(&state, d) {
+                                        let nid = self.author_to_node_id(a);
+                                        resolved.push(format!("[{},{}]", rd, nid));
+                                    } else {
+                                        resolved.push("[?,?]".to_string());
+                                    }
                                 }
-                            }
-                            resolved.sort();
+                                resolved.sort();
+                                (contains_leader_header, contains_leader_digest, resolved)
+                            };
+                            let (step_contains_leader_header, step_contains_leader_digest, step_resolved) =
+                                describe_vertices(&cert.header.solid_step_vertices);
+                            let (wave_contains_leader_header, wave_contains_leader_digest, wave_resolved) =
+                                describe_vertices(&cert.header.solid_wave_vertices);
 
                             debug!(
-                                "support_round cert: node={} cert_round={} cert_digest={:?} base_len={} contains(leader_header_id)={} contains(leader_digest)={} vertices={}",
+                                "support_round cert: node={} cert_round={} cert_digest={:?} step_len={} step_contains(leader_header_id)={} step_contains(leader_digest)={} step_vertices={} wave_len={} wave_contains(leader_header_id)={} wave_contains(leader_digest)={} wave_vertices={}",
                                 node_id,
                                 cert.round(),
                                 cert_digest,
-                                base.len(),
-                                contains_leader_header,
-                                contains_leader_digest,
-                                resolved.join(", ")
+                                cert.header.solid_step_vertices.len(),
+                                step_contains_leader_header,
+                                step_contains_leader_digest,
+                                step_resolved.join(", "),
+                                cert.header.solid_wave_vertices.len(),
+                                wave_contains_leader_header,
+                                wave_contains_leader_digest,
+                                wave_resolved.join(", ")
                             );
                         }
                     } else {
@@ -381,14 +430,29 @@ leader_digest(cert)= {:?} -> {:?} (node_id={})",
             }
 
             info!(
-                "DAG_COMMIT_CHECK path=solid leader_round={} leader_node={} support_round={} support_basis=solid_wave_vertices stake={} threshold={} result=committed support_set={:?}",
+                "DAG_COMMIT_CHECK path=solid leader_round={} leader_node={} support_round={} support_basis=solid_step_vertices stake={} threshold={} result=committed support_set={:?}",
                 leader_round,
                 leader_node,
                 support_round,
                 stake,
                 threshold,
-                support_nodes
+                step_support_nodes
             );
+            if support_disagrees {
+                info!(
+                    "DAG_COMMIT_SUPPORT_COMPARE leader_round={} leader_node={} support_round={} threshold={} step_stake={} step_support_set={:?} wave_stake={} wave_support_set={:?} step_only={:?} wave_only={:?}",
+                    leader_round,
+                    leader_node,
+                    support_round,
+                    threshold,
+                    step_stake,
+                    step_support_nodes,
+                    wave_stake,
+                    wave_support_nodes,
+                    step_only_nodes,
+                    wave_only_nodes
+                );
+            }
             if let Some(entries) = support_entries {
                 debug!(
                     "DAG_COMMIT_SUPPORT leader_round={} support_round={} detail={}",
