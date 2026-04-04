@@ -110,24 +110,24 @@ impl State {
         let last_committed = &self.last_committed;
         let mut removed = Vec::new();
 
-        // self.dag.retain(|round, authorities| {
-        //     let keep_round = *round + gc_depth >= last_committed_certificate_round;
+        self.dag.retain(|round, authorities| {
+            let keep_round = *round + gc_depth >= last_committed_certificate_round;
 
-        //     authorities.retain(|author, (digest, certificate)| {
-        //         let keep_certificate =
-        //             keep_round && *round >= last_committed.get(author).copied().unwrap_or_default();
-        //         if !keep_certificate {
-        //             removed.push((digest.clone(), certificate.header.id.clone()));
-        //         }
-        //         keep_certificate
-        //     });
+            authorities.retain(|author, (digest, certificate)| {
+                let keep_certificate =
+                    keep_round && *round >= last_committed.get(author).copied().unwrap_or_default();
+                if !keep_certificate {
+                    removed.push((digest.clone(), certificate.header.id.clone()));
+                }
+                keep_certificate
+            });
 
-        //     !authorities.is_empty()
-        // });
+            !authorities.is_empty()
+        });
 
-        // for (certificate_digest, header_id) in removed {
-        //     self.remove_indexes(&certificate_digest, &header_id);
-        // }
+        for (certificate_digest, header_id) in removed {
+            self.remove_indexes(&certificate_digest, &header_id);
+        }
     }
 
     fn update_last_committed_leader(&mut self, leader_round: Round) {
@@ -201,7 +201,7 @@ impl Consensus {
             state.insert(certificate);
 
             // Emit DAG visualization for extract_final_dag / extract_dag_out (full DAG per round).
-            self.visualize_dag(&state, round);
+            // self.visualize_dag(&state, round);
 
             // Narwhal-style commit loop adapted to solid waves:
             // only commit on solid-wave boundary rounds, and validate the leader from the

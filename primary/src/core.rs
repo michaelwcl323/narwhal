@@ -510,7 +510,7 @@ impl Core {
         // Aggregate certificates by their own round instead of a single global current_round.
         // Whichever round reaches the unlock condition first can be dispatched to proposer first.
         let target_round_start = certificate.round();
-        let target_round_end = target_round_start + self.committee.solid_wave_length();
+        let target_round_end = target_round_start + self.committee.solid_step_length();
         for target_round in target_round_start..target_round_end {
             if let Some(parents) = self
                 .certificates_aggregators
