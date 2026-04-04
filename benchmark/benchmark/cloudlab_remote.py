@@ -17,6 +17,7 @@ from copy import deepcopy
 import subprocess
 import re
 import shlex
+import ipaddress
 
 from benchmark.config import Committee, Key, NodeParameters, BenchParameters, ConfigError
 from benchmark.utils import BenchError, Print, PathMaker
@@ -26,12 +27,57 @@ from benchmark.cloudlab_instance import CloudLabInstanceManager
 from benchmark.imbalanced_rate import ZipfAllocator
 
 
+def _fabric_connection_label(conn) -> str:
+    """Best-effort hostname for a Fabric Connection (GroupResult dict key)."""
+    return str(getattr(conn, "host", conn))
+
+
+def _print_fabric_group_diagnostics(group_result, title: str) -> None:
+    """
+    Print stdout/stderr for every host in a Fabric GroupResult.
+
+    Used when Group.run(..., hide=True) fails so cargo/git errors are visible.
+    Values may be invoke Result objects or BaseException if the runner failed.
+    """
+    Print.info(title)
+    for conn, value in group_result.items():
+        label = _fabric_connection_label(conn)
+        if isinstance(value, BaseException):
+            Print.info(f"  --- {label}: runner error {type(value).__name__}: {value} ---")
+            continue
+        ok = getattr(value, "ok", None)
+        exited = getattr(value, "exited", None)
+        Print.info(f"  --- {label} (ok={ok}, exited={exited}) ---")
+        stdout = (getattr(value, "stdout", None) or "").rstrip()
+        stderr = (getattr(value, "stderr", None) or "").rstrip()
+        if stdout:
+            Print.info("  [stdout]\n" + stdout)
+        if stderr:
+            Print.info("  [stderr]\n" + stderr)
+        if not stdout and not stderr:
+            Print.info("  (no stdout/stderr captured)")
+
+
 class FabricError(Exception):
     """Wrapper for Fabric exception with a meaningful error message."""
-    
+
     def __init__(self, error):
         assert isinstance(error, GroupException)
-        message = list(error.result.values())[-1]
+        parts = []
+        for conn, value in error.result.items():
+            label = _fabric_connection_label(conn)
+            if isinstance(value, BaseException):
+                parts.append(f"{label}: {type(value).__name__}: {value}")
+                continue
+            if getattr(value, "ok", True):
+                continue
+            tail = (getattr(value, "stderr", None) or "").strip()
+            if not tail:
+                tail = (getattr(value, "stdout", None) or "").strip()
+            if len(tail) > 2000:
+                tail = "... " + tail[-2000:]
+            parts.append(f"{label}: exit={getattr(value, 'exited', '?')} {tail}")
+        message = "\n".join(parts) if parts else str(list(error.result.values())[-1])
         super().__init__(message)
 
 
@@ -102,6 +148,659 @@ class CloudLabBench:
         kwargs.pop('timeout', None)
         kwargs.pop('connect_timeout', None)
         return kwargs
+
+    @staticmethod
+    def _normalize_ipv4(value, label='Host'):
+        """Validate and normalize an IPv4 address stored in settings."""
+        host = value.split(':')[0]
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError as e:
+            raise BenchError(f'{label} "{value}" is not a valid IPv4 address', e)
+
+        if address.version != 4:
+            raise BenchError(f'{label} "{value}" must be an IPv4 address')
+
+        return str(address)
+
+    def _discover_interconnect_subnets(self, hosts, prefix):
+        """Derive routed subnets from the configured CloudLab hosts."""
+        assert isinstance(hosts, list)
+
+        if prefix < 1 or prefix > 32:
+            raise BenchError(f'Invalid IPv4 prefix length: {prefix}')
+
+        subnets = []
+        seen = set()
+
+        for host in hosts:
+            host_ip = self._normalize_ipv4(host['hostname'])
+            network = ipaddress.ip_network(f'{host_ip}/{prefix}', strict=False)
+            network_str = str(network)
+            if network_str not in seen:
+                seen.add(network_str)
+                subnets.append(network_str)
+
+        return subnets
+
+    @staticmethod
+    def _build_interconnect_command(
+        remote_script,
+        action,
+        role,
+        gateway,
+        subnets=None,
+        verify_hosts=None,
+        local_ip=None,
+        dev=None,
+    ):
+        """Build a safely quoted remote command line for the interconnect script."""
+        argv = [
+            'bash',
+            remote_script,
+            action,
+            '--role',
+            role,
+            '--gateway',
+            gateway,
+        ]
+
+        if local_ip:
+            argv += ['--local-ip', local_ip]
+        if dev:
+            argv += ['--dev', dev]
+        if subnets:
+            argv += ['--subnets', ','.join(subnets)]
+        if verify_hosts:
+            argv += ['--verify-hosts', ','.join(verify_hosts)]
+
+        return ' '.join(shlex.quote(x) for x in argv)
+
+    def _run_interconnect_script(
+        self,
+        host,
+        script_path,
+        action,
+        role,
+        gateway,
+        subnets=None,
+        verify_hosts=None,
+        local_ip=None,
+        dev=None,
+    ):
+        """Upload and execute the interconnect helper script on a host."""
+        username = host.get('username', 'root')
+        hostname = host['hostname']
+        port = host.get('port', 22)
+        conn_kwargs = self._get_connection_kwargs(host)
+        remote_script = f'/tmp/narwhal-interconnect-{role}.sh'
+
+        conn = Connection(
+            hostname,
+            user=username,
+            port=port,
+            connect_kwargs=conn_kwargs,
+            connect_timeout=30,
+        )
+
+        try:
+            conn.put(str(script_path), remote=remote_script)
+            command = self._build_interconnect_command(
+                remote_script,
+                action,
+                role,
+                gateway,
+                subnets=subnets,
+                verify_hosts=verify_hosts,
+                local_ip=local_ip,
+                dev=dev,
+            )
+            result = conn.run(
+                f'chmod +x {shlex.quote(remote_script)} && {command}',
+                hide=True,
+                warn=True,
+            )
+            if not result.ok:
+                stderr = result.stderr.strip()
+                stdout = result.stdout.strip()
+                raise ExecutionError(stderr or stdout or 'interconnect script failed')
+            return result.stdout.strip()
+        finally:
+            try:
+                conn.run(f'rm -f {shlex.quote(remote_script)}', hide=True, warn=True)
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def configure_interconnect(
+        self,
+        gateway='10.4.1.1',
+        prefix=16,
+        configure_router=False,
+        router_host=None,
+        router_user=None,
+        router_port=22,
+        verify=True,
+        dev=None,
+        router_dev=None,
+    ):
+        """Configure static routes so hosts can reach each other through a gateway."""
+        gateway_ip = self._normalize_ipv4(gateway, label='Gateway')
+        hosts = self.manager.get_host_info()
+        if not hosts:
+            raise BenchError('No CloudLab hosts found in settings')
+
+        leaf_hosts = []
+        for host in hosts:
+            if self._normalize_ipv4(host['hostname']) == gateway_ip:
+                Print.info(f'Skipping gateway host {host["hostname"]} when applying leaf routes')
+                continue
+            leaf_hosts.append(host)
+
+        if not leaf_hosts:
+            raise BenchError('No non-gateway CloudLab hosts available for interconnect setup')
+
+        script_path = (
+            Path(__file__).resolve().parents[2]
+            / 'script'
+            / 'remote_control'
+            / 'ensure_interconnect_via_gateway.sh'
+        )
+        if not script_path.exists():
+            raise BenchError('Missing interconnect helper script', FileNotFoundError(script_path))
+
+        subnets = self._discover_interconnect_subnets(leaf_hosts, int(prefix))
+        verify_hosts = [
+            self._normalize_ipv4(host['hostname']) for host in leaf_hosts
+        ] if verify else None
+
+        Print.heading(f'Configuring routed interconnect via {gateway_ip}...')
+        Print.info(f'Routed networks: {", ".join(subnets)}')
+
+        failures = []
+
+        if configure_router:
+            router_target = router_host or gateway_ip
+            router_config = {
+                'hostname': router_target,
+                'username': router_user or leaf_hosts[0].get('username', 'root'),
+                'port': int(router_port),
+            }
+            Print.info(
+                f'Configuring router forwarding on '
+                f'{router_config["username"]}@{router_config["hostname"]}:{router_config["port"]}...'
+            )
+            try:
+                output = self._run_interconnect_script(
+                    router_config,
+                    script_path,
+                    action='apply',
+                    role='router',
+                    gateway=gateway_ip,
+                    dev=router_dev,
+                )
+                if output:
+                    print(output)
+            except Exception as e:
+                failures.append(
+                    f'{router_config["username"]}@{router_config["hostname"]}:{router_config["port"]}: {e}'
+                )
+
+        for host in leaf_hosts:
+            username = host.get('username', 'root')
+            hostname = host['hostname']
+            port = host.get('port', 22)
+            host_ip = self._normalize_ipv4(hostname)
+            Print.info(f'Applying leaf routes on {username}@{hostname}:{port}...')
+            try:
+                output = self._run_interconnect_script(
+                    host,
+                    script_path,
+                    action='apply',
+                    role='leaf',
+                    gateway=gateway_ip,
+                    local_ip=host_ip,
+                    dev=dev,
+                )
+                if output:
+                    print(output)
+            except Exception as e:
+                failures.append(f'{username}@{hostname}:{port}: {e}')
+
+        if verify:
+            Print.info('Verifying routed connectivity on all leaf nodes...')
+            for host in leaf_hosts:
+                username = host.get('username', 'root')
+                hostname = host['hostname']
+                port = host.get('port', 22)
+                host_ip = self._normalize_ipv4(hostname)
+                try:
+                    output = self._run_interconnect_script(
+                        host,
+                        script_path,
+                        action='verify',
+                        role='leaf',
+                        gateway=gateway_ip,
+                        verify_hosts=verify_hosts,
+                        local_ip=host_ip,
+                        dev=dev,
+                    )
+                    if output:
+                        print(output)
+                except Exception as e:
+                    failures.append(f'{username}@{hostname}:{port}: {e}')
+
+        if failures:
+            raise BenchError('Failed to configure routed interconnect', ExecutionError('\n'.join(failures)))
+
+        Print.heading('Interconnect configuration completed')
+
+    @staticmethod
+    def _infer_wan_role(hostname):
+        """Infer WAN shaping role from the configured host IP."""
+        if hostname.startswith('10.1.'):
+            return 'eu'
+        if hostname.startswith('10.2.'):
+            return 'na'
+        if hostname.startswith('10.3.'):
+            return 'as'
+        if hostname.startswith('10.4.'):
+            return 'router'
+        return None
+
+    @staticmethod
+    def _build_wan_command(
+        remote_script,
+        action,
+        role,
+        gateway,
+        local_ip=None,
+        dev=None,
+        rate=None,
+    ):
+        """Build a safely quoted remote command line for WAN shaping."""
+        argv = [
+            'bash',
+            remote_script,
+            action,
+            '--role',
+            role,
+            '--gateway',
+            gateway,
+        ]
+
+        if local_ip:
+            argv += ['--local-ip', local_ip]
+        if dev:
+            argv += ['--dev', dev]
+        if rate:
+            argv += ['--rate', rate]
+
+        return ' '.join(shlex.quote(x) for x in argv)
+
+    def _run_wan_script(
+        self,
+        host,
+        script_path,
+        action,
+        role,
+        gateway,
+        local_ip=None,
+        dev=None,
+        rate=None,
+    ):
+        """Upload and execute the WAN shaping helper script on a host."""
+        username = host.get('username', 'root')
+        hostname = host['hostname']
+        port = host.get('port', 22)
+        conn_kwargs = self._get_connection_kwargs(host)
+        remote_script = f'/tmp/narwhal-wan-netem-{role}.sh'
+
+        conn = Connection(
+            hostname,
+            user=username,
+            port=port,
+            connect_kwargs=conn_kwargs,
+            connect_timeout=30,
+        )
+
+        try:
+            conn.put(str(script_path), remote=remote_script)
+            command = self._build_wan_command(
+                remote_script,
+                action,
+                role,
+                gateway,
+                local_ip=local_ip,
+                dev=dev,
+                rate=rate,
+            )
+            result = conn.run(
+                f'chmod +x {shlex.quote(remote_script)} && {command}',
+                hide=True,
+                warn=True,
+            )
+            if not result.ok:
+                stderr = result.stderr.strip()
+                stdout = result.stdout.strip()
+                raise ExecutionError(stderr or stdout or 'WAN shaping script failed')
+            return result.stdout.strip()
+        finally:
+            try:
+                conn.run(f'rm -f {shlex.quote(remote_script)}', hide=True, warn=True)
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _wan_route_probes(role):
+        """Representative destinations that should route through the WAN gateway."""
+        probes = {
+            'eu': ['10.2.1.1', '10.3.1.1'],
+            'na': ['10.1.1.1', '10.3.1.1'],
+            'as': ['10.1.1.1', '10.2.1.1'],
+        }
+        return probes.get(role, [])
+
+    def _verify_wan_host_state(
+        self,
+        host,
+        script_path,
+        gateway,
+        role,
+        local_ip=None,
+        dev=None,
+        rate=None,
+    ):
+        """Verify that a host is using the intended routed WAN path."""
+        output = self._run_wan_script(
+            host,
+            script_path,
+            action='show',
+            role=role,
+            gateway=gateway,
+            local_ip=local_ip,
+            dev=dev,
+            rate=rate,
+        )
+
+        errors = []
+        detected_dev = None
+        for line in output.splitlines():
+            if line.startswith('dev='):
+                detected_dev = line.split('=', 1)[1].strip() or None
+                break
+        if role == 'router':
+            if 'net.ipv4.ip_forward = 1' not in output:
+                errors.append('router ip_forward is not enabled')
+            if 'net.ipv4.conf.all.send_redirects = 0' not in output:
+                errors.append('router send_redirects is not disabled')
+            if 'net.ipv4.conf.all.accept_redirects = 0' not in output:
+                errors.append('router accept_redirects is not disabled')
+            return errors
+
+        if 'qdisc prio 1: root' not in output:
+            errors.append('root prio qdisc is missing')
+        if 'flowid 1:' not in output:
+            errors.append('tc destination filters are missing')
+        if 'net.ipv4.conf.all.send_redirects = 0' not in output:
+            errors.append('leaf send_redirects is not disabled')
+        if 'net.ipv4.conf.all.accept_redirects = 0' not in output:
+            errors.append('leaf accept_redirects is not disabled')
+        checked_dev = dev or detected_dev
+        if checked_dev and f'net.ipv4.conf.{checked_dev}.send_redirects = 0' not in output:
+            errors.append(f'leaf send_redirects is not disabled on {checked_dev}')
+        if checked_dev and f'net.ipv4.conf.{checked_dev}.accept_redirects = 0' not in output:
+            errors.append(f'leaf accept_redirects is not disabled on {checked_dev}')
+
+        username = host.get('username', 'root')
+        hostname = host['hostname']
+        port = host.get('port', 22)
+        conn_kwargs = self._get_connection_kwargs(host)
+        conn = Connection(
+            hostname,
+            user=username,
+            port=port,
+            connect_kwargs=conn_kwargs,
+            connect_timeout=30,
+        )
+
+        try:
+            conn.run(
+                'sudo ip route flush cache || sudo sysctl -w net.ipv4.route.flush=1 >/dev/null',
+                hide=True,
+                warn=True,
+            )
+            for probe in self._wan_route_probes(role):
+                route = conn.run(f'ip -4 route get {shlex.quote(probe)}', hide=True, warn=True)
+                route_text = (route.stdout or route.stderr or '').strip()
+                if f'via {gateway}' not in route_text:
+                    errors.append(
+                        f'route to {probe} does not use gateway {gateway}: '
+                        f'{route_text or "no route output"}'
+                    )
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+        return errors
+
+    def _ensure_verified_wan_host(
+        self,
+        host,
+        script_path,
+        gateway,
+        role,
+        local_ip=None,
+        dev=None,
+        rate=None,
+        attempts=2,
+    ):
+        """Verify a WAN host and retry apply if the expected state is missing."""
+        attempts = max(1, int(attempts))
+        last_errors = []
+        username = host.get('username', 'root')
+        hostname = host['hostname']
+        port = host.get('port', 22)
+
+        for attempt in range(1, attempts + 1):
+            errors = self._verify_wan_host_state(
+                host,
+                script_path,
+                gateway,
+                role,
+                local_ip=local_ip,
+                dev=dev,
+                rate=rate,
+            )
+            if not errors:
+                return None
+
+            last_errors = errors
+            if attempt == attempts:
+                break
+
+            Print.warn(
+                f'WAN verification failed on {username}@{hostname}:{port} '
+                f'({"; ".join(errors)}). Reapplying...'
+            )
+            self._run_wan_script(
+                host,
+                script_path,
+                action='apply',
+                role=role,
+                gateway=gateway,
+                local_ip=local_ip,
+                dev=dev,
+                rate=rate,
+            )
+
+        return '; '.join(last_errors)
+
+    def configure_wan_delay(
+        self,
+        action='apply',
+        gateway='10.4.1.1',
+        configure_router=True,
+        router_host=None,
+        router_user=None,
+        router_port=22,
+        verify=True,
+        dev=None,
+        router_dev=None,
+        rate='100mbit',
+    ):
+        """Configure WAN routes and tc netem rules on CloudLab hosts."""
+        action = str(action).lower()
+        if action not in {'apply', 'clean', 'show'}:
+            raise BenchError(
+                f'Invalid WAN action: {action}',
+                ValueError('action must be one of apply, clean, show'),
+            )
+
+        gateway_ip = self._normalize_ipv4(gateway, label='Gateway')
+        hosts = self.manager.get_host_info()
+        if not hosts:
+            raise BenchError('No CloudLab hosts found in settings', ValueError('empty host list'))
+
+        script_path = (
+            Path(__file__).resolve().parents[2]
+            / 'script'
+            / 'remote_control'
+            / 'configure_wan_netem.sh'
+        )
+        if not script_path.exists():
+            raise BenchError('Missing WAN helper script', FileNotFoundError(script_path))
+
+        eligible_hosts = []
+        for host in hosts:
+            host_ip = self._normalize_ipv4(host['hostname'])
+            role = self._infer_wan_role(host_ip)
+            if role in {'eu', 'na', 'as'}:
+                eligible_hosts.append((host, host_ip, role))
+            elif host_ip == gateway_ip and not configure_router:
+                Print.info(f'Skipping gateway host {host_ip}')
+
+        if not eligible_hosts:
+            raise BenchError(
+                'No WAN leaf hosts found in settings',
+                ValueError('expected 10.1.x, 10.2.x, or 10.3.x hosts'),
+            )
+
+        failures = []
+        Print.heading(f'Applying WAN action "{action}" via gateway {gateway_ip}...')
+
+        if configure_router:
+            router_target = router_host or gateway_ip
+            router_config = {
+                'hostname': router_target,
+                'username': router_user or eligible_hosts[0][0].get('username', 'root'),
+                'port': int(router_port),
+            }
+            Print.info(
+                f'Configuring router on '
+                f'{router_config["username"]}@{router_config["hostname"]}:{router_config["port"]}...'
+            )
+            try:
+                output = self._run_wan_script(
+                    router_config,
+                    script_path,
+                    action=action,
+                    role='router',
+                    gateway=gateway_ip,
+                    local_ip=gateway_ip,
+                    dev=router_dev,
+                    rate=rate,
+                )
+                if output:
+                    print(output)
+            except Exception as e:
+                failures.append(
+                    f'{router_config["username"]}@{router_config["hostname"]}:{router_config["port"]}: {e}'
+                )
+
+        for host, host_ip, role in eligible_hosts:
+            username = host.get('username', 'root')
+            hostname = host['hostname']
+            port = host.get('port', 22)
+            Print.info(f'Configuring {role.upper()} host {username}@{hostname}:{port}...')
+            try:
+                output = self._run_wan_script(
+                    host,
+                    script_path,
+                    action=action,
+                    role=role,
+                    gateway=gateway_ip,
+                    local_ip=host_ip,
+                    dev=dev,
+                    rate=rate,
+                )
+                if output:
+                    print(output)
+            except Exception as e:
+                failures.append(f'{username}@{hostname}:{port}: {e}')
+
+        if verify and action == 'apply':
+            Print.info('Verifying routed WAN state on all hosts...')
+            if configure_router:
+                router_target = router_host or gateway_ip
+                router_config = {
+                    'hostname': router_target,
+                    'username': router_user or eligible_hosts[0][0].get('username', 'root'),
+                    'port': int(router_port),
+                }
+                try:
+                    error = self._ensure_verified_wan_host(
+                        router_config,
+                        script_path,
+                        gateway_ip,
+                        role='router',
+                        local_ip=gateway_ip,
+                        dev=router_dev,
+                        rate=rate,
+                        attempts=2,
+                    )
+                    if error:
+                        failures.append(
+                            f'{router_config["username"]}@{router_config["hostname"]}:{router_config["port"]}: {error}'
+                        )
+                except Exception as e:
+                    failures.append(
+                        f'{router_config["username"]}@{router_config["hostname"]}:{router_config["port"]}: {e}'
+                    )
+
+            for host, host_ip, role in eligible_hosts:
+                username = host.get('username', 'root')
+                hostname = host['hostname']
+                port = host.get('port', 22)
+                try:
+                    error = self._ensure_verified_wan_host(
+                        host,
+                        script_path,
+                        gateway_ip,
+                        role=role,
+                        local_ip=host_ip,
+                        dev=dev,
+                        rate=rate,
+                        attempts=2,
+                    )
+                    if error:
+                        failures.append(f'{username}@{hostname}:{port}: {error}')
+                except Exception as e:
+                    failures.append(f'{username}@{hostname}:{port}: {e}')
+
+        if failures:
+            raise BenchError('Failed to configure WAN delay', ExecutionError('\n'.join(failures)))
+
+        Print.heading('WAN delay configuration completed')
     
     def test_connections(self):
         """Test SSH connections to all CloudLab nodes"""
@@ -260,23 +959,26 @@ class CloudLabBench:
         
         # Commands to check running processes
         check_cmd = '''
+            primary_pids=$(ps -eo pid=,args= | awk '/(^|\/)(node|target\/release\/node)( |$)/ && / primary( |$)/ && !/awk/ {print $1}') &&
+            worker_pids=$(ps -eo pid=,args= | awk '/(^|\/)(node|target\/release\/node)( |$)/ && / worker( |$)/ && !/awk/ {print $1}') &&
+            client_pids=$(ps -eo pid=,args= | awk '/(^|\/)(benchmark_client|target\/release\/benchmark_client)( |$)/ && !/awk/ {print $1}') &&
             echo "=== Node Status ===" && 
             echo "Hostname: $(hostname)" &&
             echo "---" &&
             echo "Running processes:" &&
-            (pgrep -f "node.*primary" > /dev/null && echo "  [OK] Primary: running" || echo "  [FAIL] Primary: not running") &&
-            (pgrep -f "node.*worker" > /dev/null && echo "  [OK] Worker: running" || echo "  [FAIL] Worker: not running") &&
-            (pgrep -f "benchmark_client" > /dev/null && echo "  [OK] Client: running" || echo "  [FAIL] Client: not running") &&
+            ([ -n "$primary_pids" ] && echo "  [OK] Primary: running" || echo "  [FAIL] Primary: not running") &&
+            ([ -n "$worker_pids" ] && echo "  [OK] Worker: running" || echo "  [FAIL] Worker: not running") &&
+            ([ -n "$client_pids" ] && echo "  [OK] Client: running" || echo "  [FAIL] Client: not running") &&
             echo "---" &&
             echo "Process count:" &&
-            echo "  Primary: $(pgrep -f 'node.*primary' | wc -l)" &&
-            echo "  Worker: $(pgrep -f 'node.*worker' | wc -l)" &&
-            echo "  Client: $(pgrep -f 'benchmark_client' | wc -l)" &&
+            echo "  Primary: $(printf '%s\n' "$primary_pids" | sed '/^$/d' | wc -l)" &&
+            echo "  Worker: $(printf '%s\n' "$worker_pids" | sed '/^$/d' | wc -l)" &&
+            echo "  Client: $(printf '%s\n' "$client_pids" | sed '/^$/d' | wc -l)" &&
             echo "---" &&
             echo "Process details:" &&
-            (pgrep -f "node.*primary" | xargs ps -p 2>/dev/null | tail -n +2 || echo "  No primary processes") &&
-            (pgrep -f "node.*worker" | xargs ps -p 2>/dev/null | tail -n +2 || echo "  No worker processes") &&
-            (pgrep -f "benchmark_client" | xargs ps -p 2>/dev/null | tail -n +2 || echo "  No client processes")
+            ([ -n "$primary_pids" ] && printf '%s\n' "$primary_pids" | xargs ps -fp 2>/dev/null | tail -n +2 || echo "  No primary processes") &&
+            ([ -n "$worker_pids" ] && printf '%s\n' "$worker_pids" | xargs ps -fp 2>/dev/null | tail -n +2 || echo "  No worker processes") &&
+            ([ -n "$client_pids" ] && printf '%s\n' "$client_pids" | xargs ps -fp 2>/dev/null | tail -n +2 || echo "  No client processes")
         '''
         
         try:
@@ -356,16 +1058,19 @@ class CloudLabBench:
         repo_name = self.settings.repo_name
         
         debug_cmd = f'''
+            primary_pids=$(ps -eo pid=,args= | awk '/(^|\/)(node|target\/release\/node)( |$)/ && / primary( |$)/ && !/awk/ {{print $1}}') &&
+            worker_pids=$(ps -eo pid=,args= | awk '/(^|\/)(node|target\/release\/node)( |$)/ && / worker( |$)/ && !/awk/ {{print $1}}') &&
+            client_pids=$(ps -eo pid=,args= | awk '/(^|\/)(benchmark_client|target\/release\/benchmark_client)( |$)/ && !/awk/ {{print $1}}') &&
             echo "=== Debugging $(hostname) ===" &&
             echo "--- Running Processes ---" &&
             echo "Primary processes:" &&
-            (pgrep -f "node.*primary" | xargs ps -fp 2>/dev/null || echo "  No primary processes") &&
+            ([ -n "$primary_pids" ] && printf '%s\n' "$primary_pids" | xargs ps -fp 2>/dev/null || echo "  No primary processes") &&
             echo "" &&
             echo "Worker processes:" &&
-            (pgrep -f "node.*worker" | xargs ps -fp 2>/dev/null || echo "  No worker processes") &&
+            ([ -n "$worker_pids" ] && printf '%s\n' "$worker_pids" | xargs ps -fp 2>/dev/null || echo "  No worker processes") &&
             echo "" &&
             echo "Client processes:" &&
-            (pgrep -f "benchmark_client" | xargs ps -fp 2>/dev/null || echo "  No client processes") &&
+            ([ -n "$client_pids" ] && printf '%s\n' "$client_pids" | xargs ps -fp 2>/dev/null || echo "  No client processes") &&
             echo "" &&
             echo "--- Log files in {repo_name}/logs ---" &&
             (ls -lh {repo_name}/logs/*.log 2>/dev/null | head -10 || echo "No log files found") &&
@@ -511,6 +1216,13 @@ class CloudLabBench:
             pkill -9 -f "benchmark_client" 2>/dev/null || true
             # Also kill any wrapper scripts that might still be running
             pkill -9 -f "/tmp/run_(primary|worker|client)-" 2>/dev/null || true
+            # Kill any in-flight cargo build jobs spawned during benchmark setup
+            pkill -9 -f "cargo build" 2>/dev/null || true
+            pkill -9 -f "/.cargo/bin/cargo" 2>/dev/null || true
+            pkill -9 -f "rustc" 2>/dev/null || true
+            pkill -9 -f "cc " 2>/dev/null || true
+            pkill -9 -f "clang" 2>/dev/null || true
+            pkill -9 -f "build-script-build" 2>/dev/null || true
             true
         '''
         # Cleanup database directories and lock files
@@ -690,6 +1402,11 @@ class CloudLabBench:
             'echo "C compiler not found; installing build-essential"; '
             'sudo apt-get update && sudo apt-get install -y build-essential; '
             'fi',
+            # rocksdb -> librocksdb-sys may pull libz-sys / bzip2-sys. Bundled zlib (zutil.c) often
+            # fails on CloudLab with empty cc stderr; system zlib via pkg-config avoids that build.
+            'echo "Installing zlib/bzip2 dev + pkg-config for libz-sys/libbz2-sys"; '
+            'sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && '
+            'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y zlib1g-dev libbz2-dev pkg-config',
             'echo "Pre-build diagnostics:"',
             'df -h . || true',
             'df -i . || true',
@@ -732,7 +1449,12 @@ class CloudLabBench:
                     modify_hosts = [{'hostname': h, 'username': username, 'port': port} for h in hostnames]
                     self._modify_attack_rs(modify_hosts, trigger_attack)
         except (GroupException, ExecutionError) as e:
-            e = FabricError(e) if isinstance(e, GroupException) else e
+            if isinstance(e, GroupException):
+                _print_fabric_group_diagnostics(
+                    e.result,
+                    "Failed to update nodes — full output per host (git/rustup/cargo):",
+                )
+                e = FabricError(e)
             raise BenchError('Failed to update nodes', e)
     
     def _config(self, hosts, node_parameters, bench_parameters):
@@ -1563,11 +2285,15 @@ SCRIPTEOF'''
                                 bench_parameters.tx_size,
                             ))
                         except (subprocess.SubprocessError, GroupException, ParseError) as e:
-                            self.kill(hosts=selected_hosts)
                             if isinstance(e, GroupException):
                                 e = FabricError(e)
-                            Print.error(BenchError('Benchmark failed', e))
-                            continue
+                            failure = BenchError('Benchmark failed', e)
+                            Print.error(failure)
+                            Print.warn('Leaving remote processes and logs intact for debugging.')
+                            try:
+                                input('Benchmark paused. Inspect the remote nodes, then press Enter to exit... ')
+                            except EOFError:
+                                pass
+                            raise failure
         
         Print.heading('All benchmarks completed')
-
