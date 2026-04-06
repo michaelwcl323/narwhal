@@ -107,7 +107,7 @@ impl Proposer {
         let solid_step_length = committee.solid_step_length() as u64;
         let solid_wave_length = committee.solid_wave_length() as u64;
         // Disable the parent grace delay so newly unlocked rounds can be proposed immediately.
-        let parent_grace_delay_ms = 200;
+        let parent_grace_delay_ms = 100;
 
         let mut unlocked_rounds = HashMap::new();
         unlocked_rounds.insert(
