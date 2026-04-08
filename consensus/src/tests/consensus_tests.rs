@@ -33,6 +33,10 @@ pub fn mock_committee() -> Committee {
                 )
             })
             .collect(),
+        sigma: 1,
+        kappa: 2,
+        reference: 3,
+        coverage: 3,
     }
 }
 
