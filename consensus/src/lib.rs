@@ -264,11 +264,7 @@ impl Consensus {
 
             #[cfg(feature = "benchmark")]
             for batch in certificate.header.payload.keys() {
-                info!(
-                    "Committed {} -> batch_size={}B",
-                    certificate.header,
-                    batch.size()
-                );
+                info!("Committed {} -> {:?}", certificate.header, batch);
             }
 
             self.tx_primary
