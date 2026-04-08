@@ -267,7 +267,7 @@ impl Consensus {
                 info!(
                     "Committed {} -> batch_size={}B",
                     certificate.header,
-                    batch.len()
+                    batch.size()
                 );
             }
 
